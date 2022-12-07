@@ -3,7 +3,7 @@ mod fb_ioctl;
 use fb_defines::*;
 use fb_ioctl::*;
 
-use std::{io, fs::{File, OpenOptions}, cell::RefCell, path::Path, slice::from_raw_parts_mut};
+use std::{io, fs::{File, OpenOptions}, path::Path};
 use memmap2::{MmapMut, MmapOptions};
 use thiserror::Error;
 use std::os::unix::io::AsRawFd;
@@ -24,16 +24,19 @@ pub enum FbError {
     PanDisplay,
 }
 
+enum Frames {
+    Double(MmapMut, MmapMut),
+    Singel(MmapMut),
+}
+
 pub struct FrameBuffer {
     device:File,
-    frame: RefCell<MmapMut>,
-    vinfo: RefCell<VarScreeninfo>,
-    finfo: FixScreeninfo,
-    can_double: bool,
+    frames: Frames,
+    vinfo: VarScreeninfo,
 }
 
 impl FrameBuffer {
-    fn new(fb: &Path) -> Result<FrameBuffer, FbError> {
+    pub fn new(fb: &Path) -> Result<FrameBuffer, FbError> {
         let device = OpenOptions::new()
             .read(true)
             .write(true)
@@ -50,70 +53,73 @@ impl FrameBuffer {
                 return Err(FbError::GetVinfo);
             }
         }
-
-        let can_double = finfo.smem_len >= finfo.line_length * vinfo.yres * 2;
-        if can_double {
-            vinfo.yres_virtual = vinfo.yres * 2;
+        let screen_size = finfo.line_length * vinfo.yres;
+        if finfo.smem_len >= screen_size * 2 {
+            
             vinfo.yoffset = 0;
             unsafe {
-                if fb_set_vinfo(device.as_raw_fd(), &vinfo as *const _).is_err() {
-                    return Err(FbError::SetVinfo)
+                if vinfo.yres_virtual < vinfo.yres * 2 {
+                    vinfo.yres_virtual = vinfo.yres * 2;
+                    if fb_set_vinfo(device.as_raw_fd(), &vinfo).is_err() {
+                        return Err(FbError::SetVinfo)
+                    }
+                } else {
+                    if fb_pan_display(device.as_raw_fd(), &vinfo).is_err() {
+                        return Err(FbError::PanDisplay);
+                    }
                 }
+
             }
-        }
-        let frame = unsafe {MmapOptions::new().len(finfo.smem_len as usize).map_mut(&device)?};
-        Ok(FrameBuffer{
-            device, frame: RefCell::new(frame), vinfo: RefCell::new(vinfo), finfo, can_double
-        })
-    }
-
-    fn screen_bytes(&self) -> usize {
-        let vinfo = self.vinfo.borrow();
-        (self.finfo.line_length * vinfo.yres) as usize
-    }
-
-    fn get_fb0_buffer(&self) -> Option<&mut [u8]> {
-        let mut frame = self.frame.borrow_mut();
-        let fb = unsafe {
-            from_raw_parts_mut(frame.as_mut_ptr(), self.screen_bytes())
-        };
-        Some(fb)
-    }
-
-    fn get_fb1_buffer(&self) -> Option<&mut [u8]> {
-        if self.can_double {
-            let mut frame = self.frame.borrow_mut();
-            let fb = unsafe {
-                from_raw_parts_mut(frame.as_mut_ptr().offset(self.screen_bytes() as isize), self.screen_bytes())
-            };
-            Some(fb)
+            let frames = Frames::Double(
+                unsafe {
+                    MmapOptions::new().len(screen_size as usize).map_mut(&device)?
+                },
+                unsafe {
+                    MmapOptions::new().offset(screen_size as u64).len(screen_size as usize).map_mut(&device)?
+                }
+            );
+            Ok(Self{ device, frames, vinfo })
         } else {
-            None
+            let frames = Frames::Singel(unsafe {
+                MmapOptions::new().len(screen_size as usize).map_mut(&device)?
+            });
+            Ok(Self{ device, frames, vinfo })
+        }
+    }
+
+    pub fn get_disp_data(&mut self) -> &mut [u8] {
+        match &mut self.frames {
+            Frames::Double(disp, _) => disp.as_mut(),
+            Frames::Singel(disp) => disp.as_mut(),
+        }
+    }
+
+    pub fn get_buff_data(&mut self) -> Option<&mut [u8]> {
+        match &mut self.frames {
+            Frames::Double(_, buff) => Some(buff.as_mut()),
+            Frames::Singel(_) => None,
         }
     }
 
     pub fn color_depth(&self) -> usize {
-        let vinfo = self.vinfo.borrow();
-        vinfo.bits_per_pixel as usize
+        self.vinfo.bits_per_pixel as usize
     }
 
     pub fn screen_size(&self) -> (usize, usize) {
-        let vinfo = self.vinfo.borrow();
-        (vinfo.xres as usize, vinfo.yres as usize)
+        (self.vinfo.xres as usize, self.vinfo.yres as usize)
     }
 
-    pub fn swap(&self) -> Result<(), FbError> {
-        if !self.can_double {
-            return Ok(());
-        }
-        let mut vinfo = self.vinfo.borrow_mut();
-        vinfo.yoffset = if vinfo.yoffset == 0 { vinfo.yres } else { 0 };
-
-        unsafe {
-            if fb_pan_display(self.device.as_raw_fd(), self.vinfo.as_ptr() as *const _).is_err() {
-                return Err(FbError::PanDisplay);
+    pub fn swap(& mut self) -> Result<(), FbError> {
+        if let Frames::Double(disp, buff) = &mut self.frames {
+            self.vinfo.yoffset = if self.vinfo.yoffset == 0 { self.vinfo.yres } else { 0 };
+            unsafe {
+                if fb_pan_display(self.device.as_raw_fd(), &self.vinfo).is_err() {
+                    return Err(FbError::PanDisplay);
+                }
             }
+            std::mem::swap( disp,  buff);
         }
+
         Ok(())
     }
 }
